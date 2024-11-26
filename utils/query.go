@@ -1,222 +1,19 @@
-package main
+package utils
 
 import (
 	"fmt"
 	"math/big"
-	"os"
 	"strconv"
 	"time"
 
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/core/rawdb"
-	"github.com/ethereum/go-ethereum/core/types"
-	"github.com/ethereum/go-ethereum/params"
 	"github.com/ethereum/go-ethereum/trie"
 )
 
-var (
-	putf = fmt.Printf
-	puts = fmt.Println
-
-	dbPath      = "F:/ethereum/geth/chaindata"
-	ancientPath = dbPath + "/ancient"
-
-	// bloomPath = "H:/deleted/Accounts_"
-)
-
-func doPrune(cmdline []string) {
-	if len(cmdline) < 3 {
-		puts("Error! Must indicate checkpoint block interval, begin blknum, and end blknum.")
-		return
-	}
-	N, err := strconv.Atoi(cmdline[0])
-	if err != nil {
-		panic(err)
-	}
-	upNum, err := strconv.Atoi(cmdline[1])
-	if err != nil {
-		panic(err)
-	}
-	endNum, err := strconv.Atoi(cmdline[2])
-	if err != nil {
-		panic(err)
-	}
-
-	// Open ethereum levelDB with ancient flatten data
-	ancientDb, err := rawdb.NewLevelDBDatabaseWithFreezer(dbPath, 16, 1, ancientPath, "", false)
-	if err != nil {
-		panic(err)
-	}
-
-	// ReadHeadHeaderHash retrieves the hash of the current canonical head header.
-	currHeader := rawdb.ReadHeadHeaderHash(ancientDb)
-	putf("currHeader: %x\n", currHeader)
-
-	// ReadHeaderNumber returns the header number assigned to a hash.
-	currHeight := rawdb.ReadHeaderNumber(ancientDb, currHeader)
-	putf("currHeight: %d\n", *currHeight)
-
-	// Create in-memory trie database
-	triedb := trie.NewDatabase(ancientDb)
-
-	puts("----------------------------------------------------------------")
-
-	// Checkpoint block state list
-	var influenced_account = map[common.Address]bool{}
-	var num_of_account = 0
-	var file (*os.File)
-
-	for i := endNum; i >= upNum; i-- {
-		// set deleted account map and number for each block
-		var deleted_account = map[common.Address]bool{}
-		var total_del_account = 0
-
-		// ReadCanonicalHash retrieves the hash assigned to a canonical block number.
-		blkHash := rawdb.ReadCanonicalHash(ancientDb, uint64(i))
-
-		if blkHash == (common.Hash{}) {
-			putf("Err: Block not found: %v\n", i)
-		} else {
-			putf("Etherscan url: https://etherscan.io/block/%v\n", i)
-			putf("BlockHash: %x\n", blkHash)
-		}
-
-		// ReadHeader retrieves the block header corresponding to the hash.
-		blkHeader := rawdb.ReadHeader(ancientDb, blkHash, uint64(i))
-		putf("Block state root: 0x%x\n", blkHeader.Root)
-
-		// Retrieve state root and construct the trie accordingly
-		Trie, err := trie.NewStateTrie(common.Hash{}, blkHeader.Root, triedb)
-		if err != nil {
-			panic(err)
-		}
-
-		// ReadBody retrieves the block body corresponding to the hash.
-		blkBody := rawdb.ReadBody(ancientDb, blkHash, uint64(i))
-		putf("BlkBody Tx size: %d\n", len(blkBody.Transactions))
-
-		// Every N blocks we maintain a checkpoint block
-		if i%N == 0 {
-			// Create file indicating the deleted accounts
-			file, err = os.OpenFile("H:/deleted/Accounts_"+fmt.Sprint(i)+".txt", os.O_WRONLY|os.O_CREATE, 0666)
-			if err != nil {
-				panic(err)
-			}
-			defer file.Close()
-
-			// first empty the map
-			for acc := range influenced_account {
-				delete(influenced_account, acc)
-			}
-			putf("Last sliding window we have %v unique accounts.\n", num_of_account)
-			num_of_account = 0
-
-			// Then check each tx to find influenced account
-			for _, tx := range blkBody.Transactions {
-				// putf("tx Hash: %v\n", tx.Hash())
-				txFrom := getFromAddr(tx, big.NewInt(int64(i)))
-				if !influenced_account[txFrom] {
-					influenced_account[txFrom] = true
-					// putf("[Adding] tx From: %v\n", txFrom)
-					num_of_account++
-				}
-				if tx.To() != nil {
-					txTo := *(tx.To())
-					if !influenced_account[txTo] {
-						influenced_account[txTo] = true
-						// putf("[Adding] tx To  : %v\n", txTo)
-						num_of_account++
-					}
-				}
-			}
-		} else {
-			// Perform pruning
-			for _, tx := range blkBody.Transactions {
-				// putf("tx Hash: %v\n", tx.Hash())
-				txFrom := getFromAddr(tx, big.NewInt(int64(i)))
-				if !influenced_account[txFrom] {
-					influenced_account[txFrom] = true
-					// putf("[Adding] tx From: %v\n", txFrom)
-					num_of_account++
-				} else {
-					// Delete this account's state
-					err = Trie.TryDeleteAccount(txFrom.Bytes())
-					if err == nil {
-						if !deleted_account[txFrom] {
-							// putf("[NewDel] tx From  : %v\n", txFrom)
-							total_del_account++
-							deleted_account[txFrom] = true
-						}
-					} else {
-						puts(err)
-						putf("[ErrDel] tx From  : %v\n", txFrom)
-					}
-				}
-				if tx.To() != nil {
-					txTo := *(tx.To())
-					if !influenced_account[txTo] {
-						influenced_account[txTo] = true
-						// putf("[Adding] tx To  : %v\n", txTo)
-						num_of_account++
-					} else {
-						// Delete this account's state
-						acc, err := Trie.TryGetAccount(txTo.Bytes())
-						if err == nil {
-							if acc != nil && acc.CodeHash == nil && tx.Value().Cmp(big.NewInt(0)) == 1 {
-								err := Trie.TryDeleteAccount(txTo.Bytes())
-								if err == nil {
-									if !deleted_account[txTo] {
-										// putf("[NewDel] tx To  : %v\n", txTo)
-										total_del_account++
-										deleted_account[txTo] = true
-									}
-								} else {
-									puts(err)
-									putf("[ErrDel] tx To  : %v\n", txTo)
-								}
-							}
-						} else {
-							puts(err)
-							putf("[ErrGet] tx To  : %v\n", txTo)
-						}
-					}
-				}
-			}
-		}
-		putf("Block %v deleted %v accounts.\n", i, total_del_account)
-		for acc := range deleted_account {
-			file.WriteString(acc.String() + " ")
-			delete(deleted_account, acc)
-		}
-		file.WriteString("BLKEND\n")
-		// ReadBlock retrieves an entire block corresponding to the hash
-		if blkHash != rawdb.ReadBlock(ancientDb, blkHash, uint64(i)).Hash() {
-			puts("Error! blkhash doesn't match the block")
-			return
-		}
-		// root, nodeset, err := Trie.Commit(true)
-		// if err != nil {
-		// 	panic(err)
-		// }
-		// putf("Block %v now trie root = %v\n", i, root)
-		// if nodeset != nil {
-		// 	mergeNS := trie.NewWithNodeSet(nodeset)
-		// 	err = triedb.Update(mergeNS)
-		// 	if err != nil {
-		// 		panic(err)
-		// 	}
-		// 	err = triedb.Commit(root, false, nil)
-		// 	if err != nil {
-		// 		panic(err)
-		// 	}
-		// }
-		puts("----------------------------------------------------------------")
-	}
-}
-
-func doQuery(cmdline []string) {
+func DoQuery(cmdline []string) {
 	if len(cmdline) < 4 {
-		puts("Error! Must indicate at least the account hash, the block interval, and start/end block number.")
+		fmt.Println("Error! Must indicate at least the account hash, the block interval, and start/end block number.")
 		return
 	}
 	inter, err := strconv.Atoi(cmdline[1])
@@ -238,12 +35,12 @@ func doQuery(cmdline []string) {
 			panic(err)
 		}
 		originRangeQuery(cmdline[0], upNum, endNum, rangeint)
-		puts("------------------------------------------------------------------")
+		fmt.Println("------------------------------------------------------------------")
 		prunedRangeQuery(inter, cmdline[0], upNum, endNum, rangeint)
 	} else {
 		// do the point query
 		originPointQuery(cmdline[0], upNum, endNum)
-		puts("------------------------------------------------------------------")
+		fmt.Println("------------------------------------------------------------------")
 		prunedPointQuery(inter, cmdline[0], upNum, endNum)
 	}
 }
@@ -258,16 +55,16 @@ func originPointQuery(account string, upNum int, endNum int) {
 
 	// ReadHeadHeaderHash retrieves the hash of the current canonical head header.
 	currHeader := rawdb.ReadHeadHeaderHash(ancientDb)
-	putf("currHeader: %x\n", currHeader)
+	fmt.Printf("currHeader: %x\n", currHeader)
 
 	// ReadHeaderNumber returns the header number assigned to a hash.
 	currHeight := rawdb.ReadHeaderNumber(ancientDb, currHeader)
-	putf("currHeight: %d\n", *currHeight)
+	fmt.Printf("currHeight: %d\n", *currHeight)
 
 	// Create in-memory trie database
 	triedb := trie.NewDatabase(ancientDb)
 
-	puts("----------------------Origin Point Query----------------------")
+	fmt.Println("----------------------Origin Point Query----------------------")
 	startTime := time.Now()
 
 	var longestime = time.Duration(0)
@@ -281,12 +78,12 @@ func originPointQuery(account string, upNum int, endNum int) {
 		blkHash := rawdb.ReadCanonicalHash(ancientDb, uint64(i))
 
 		if blkHash == (common.Hash{}) {
-			putf("Err: Block not found: %v\n", i)
+			fmt.Printf("Err: Block not found: %v\n", i)
 		}
 
 		// ReadHeader retrieves the block header corresponding to the hash.
 		blkHeader := rawdb.ReadHeader(ancientDb, blkHash, uint64(i))
-		// putf("Block state root: 0x%x\n", blkHeader.Root)
+		// fmt.Printf("Block state root: 0x%x\n", blkHeader.Root)
 
 		// Retrieve state root and construct the trie accordingly
 		Trie, err := trie.NewStateTrie(common.Hash{}, blkHeader.Root, triedb)
@@ -296,10 +93,10 @@ func originPointQuery(account string, upNum int, endNum int) {
 		_, err = Trie.TryGetAccount(common.HexToAddress(account).Bytes())
 		// acc, err := Trie.TryGetAccount(common.HexToAddress(account).Bytes())
 		if err != nil {
-			puts(err)
+			fmt.Println(err)
 		}
 		// else {
-		// 	putf("Account 0x%x had balance %d in block %d.\n", common.HexToAddress(account), acc.Balance, i)
+		// 	fmt.Printf("Account 0x%x had balance %d in block %d.\n", common.HexToAddress(account), acc.Balance, i)
 		// }
 
 		roundElapsed := time.Since(roundTime) / time.Microsecond
@@ -312,17 +109,17 @@ func originPointQuery(account string, upNum int, endNum int) {
 		if roundElapsed < shortestime {
 			short2ndtime = shortestime
 			shortestime = roundElapsed
-		} else if roundElapsed < short2ndtime {
+		} else if roundElapsed > shortestime && roundElapsed < short2ndtime {
 			short2ndtime = roundElapsed
 		}
 		if i%10000 == 0 {
-			putf("Block %d passed.\n", i)
+			fmt.Printf("Block %d passed.\n", i)
 		}
 	}
 
 	elapsedTime := time.Since(startTime) / time.Microsecond
-	putf("Total query time: %d us, average %d us.\n", elapsedTime, elapsedTime/time.Duration(endNum-upNum))
-	putf("Longest query time: %d us, shortest %d us.\n", long2ndtime, short2ndtime)
+	fmt.Printf("Total query time: %d us, average %d us.\n", elapsedTime, elapsedTime/time.Duration(endNum-upNum+1))
+	fmt.Printf("Longest query time: %d us, shortest %d us.\n", long2ndtime, short2ndtime)
 }
 
 func originRangeQuery(account string, upNum int, endNum int, rangeint int) {
@@ -335,16 +132,16 @@ func originRangeQuery(account string, upNum int, endNum int, rangeint int) {
 
 	// ReadHeadHeaderHash retrieves the hash of the current canonical head header.
 	currHeader := rawdb.ReadHeadHeaderHash(ancientDb)
-	putf("currHeader: %x\n", currHeader)
+	fmt.Printf("currHeader: %x\n", currHeader)
 
 	// ReadHeaderNumber returns the header number assigned to a hash.
 	currHeight := rawdb.ReadHeaderNumber(ancientDb, currHeader)
-	putf("currHeight: %d\n", *currHeight)
+	fmt.Printf("currHeight: %d\n", *currHeight)
 
 	// Create in-memory trie database
 	triedb := trie.NewDatabase(ancientDb)
 
-	puts("----------------------Origin Range Query----------------------")
+	fmt.Println("----------------------Origin Range Query----------------------")
 	startTime := time.Now()
 
 	var longestime = time.Duration(0)
@@ -359,12 +156,12 @@ func originRangeQuery(account string, upNum int, endNum int, rangeint int) {
 			blkHash := rawdb.ReadCanonicalHash(ancientDb, uint64(j))
 
 			if blkHash == (common.Hash{}) {
-				putf("Err: Block not found: %v\n", j)
+				fmt.Printf("Err: Block not found: %v\n", j)
 			}
 
 			// ReadHeader retrieves the block header corresponding to the hash.
 			blkHeader := rawdb.ReadHeader(ancientDb, blkHash, uint64(j))
-			// putf("Block state root: 0x%x\n", blkHeader.Root)
+			// fmt.Printf("Block state root: 0x%x\n", blkHeader.Root)
 
 			// Retrieve state root and construct the trie accordingly
 			Trie, err := trie.NewStateTrie(common.Hash{}, blkHeader.Root, triedb)
@@ -374,10 +171,10 @@ func originRangeQuery(account string, upNum int, endNum int, rangeint int) {
 			_, err = Trie.TryGetAccount(common.HexToAddress(account).Bytes())
 			// acc, err := Trie.TryGetAccount(common.HexToAddress(account).Bytes())
 			if err != nil {
-				puts(err)
+				fmt.Println(err)
 			}
 			// else {
-			// 	putf("Account 0x%x had balance %d in block %d.\n", common.HexToAddress(account), acc.Balance, i)
+			// 	fmt.Printf("Account 0x%x had balance %d in block %d.\n", common.HexToAddress(account), acc.Balance, i)
 			// }
 		}
 
@@ -391,17 +188,17 @@ func originRangeQuery(account string, upNum int, endNum int, rangeint int) {
 		if roundElapsed < shortestime {
 			short2ndtime = shortestime
 			shortestime = roundElapsed
-		} else if roundElapsed < short2ndtime {
+		} else if roundElapsed > shortestime && roundElapsed < short2ndtime {
 			short2ndtime = roundElapsed
 		}
 		if i%10000 == 0 {
-			putf("Block %d passed.\n", i)
+			fmt.Printf("Block %d passed.\n", i)
 		}
 	}
 
 	elapsedTime := time.Since(startTime) / time.Microsecond
-	putf("Total query time: %d us, average %d us.\n", elapsedTime, elapsedTime/time.Duration((endNum-upNum)/rangeint+1))
-	putf("Longest query time: %d us, shortest %d us.\n", long2ndtime, short2ndtime)
+	fmt.Printf("Total query time: %d us, average %d us.\n", elapsedTime, elapsedTime/time.Duration((endNum-upNum)/rangeint+1))
+	fmt.Printf("Longest query time: %d us, shortest %d us.\n", long2ndtime, short2ndtime)
 }
 
 func prunedPointQuery(inter int, account string, upNum int, endNum int) {
@@ -414,11 +211,11 @@ func prunedPointQuery(inter int, account string, upNum int, endNum int) {
 
 	// ReadHeadHeaderHash retrieves the hash of the current canonical head header.
 	currHeader := rawdb.ReadHeadHeaderHash(ancientDb)
-	putf("currHeader: %x\n", currHeader)
+	fmt.Printf("currHeader: %x\n", currHeader)
 
 	// ReadHeaderNumber returns the header number assigned to a hash.
 	currHeight := rawdb.ReadHeaderNumber(ancientDb, currHeader)
-	putf("currHeight: %d\n", *currHeight)
+	fmt.Printf("currHeight: %d\n", *currHeight)
 
 	// Create in-memory trie database
 	triedb := trie.NewDatabase(ancientDb)
@@ -426,7 +223,7 @@ func prunedPointQuery(inter int, account string, upNum int, endNum int) {
 	// Read bloom filter
 	var prunedAddresses []map[common.Address]bool
 	// prunedAddresses = append(prunedAddresses, map[common.Address]bool{})
-	cpBlockNum := upNum - upNum%inter
+	// cpBlockNum := upNum - upNum%200
 
 	// file, err := os.OpenFile(bloomPath+fmt.Sprint(cpBlockNum+200)+".txt", os.O_RDONLY, 0666)
 	// if err != nil {
@@ -446,15 +243,17 @@ func prunedPointQuery(inter int, account string, upNum int, endNum int) {
 	// 		prunedAddresses[i][common.HexToAddress(str)] = true
 	// 	}
 	// }
-	// putf("prunedAddress length = %d\n", len(prunedAddresses))
+	// fmt.Printf("prunedAddress length = %d\n", len(prunedAddresses))
 
-	for i := cpBlockNum + 1; i <= endNum; i++ {
+	bloomTime := time.Now()
+
+	for i := upNum; i <= endNum; i++ {
 		prunedAddresses = append(prunedAddresses, map[common.Address]bool{})
 
 		// ReadCanonicalHash retrieves the hash assigned to a canonical block number.
 		blkHash := rawdb.ReadCanonicalHash(ancientDb, uint64(i))
 		if blkHash == (common.Hash{}) {
-			putf("Err: Internal Block not found: %v\n", i)
+			fmt.Printf("Err: Internal Block not found: %v\n", i)
 		}
 
 		// ReadBody retrieves the block body corresponding to the hash.
@@ -462,66 +261,72 @@ func prunedPointQuery(inter int, account string, upNum int, endNum int) {
 
 		// Retrieve transactions and perform rebuilding
 		for _, tx := range blkBody.Transactions {
-			// putf("tx Hash: %v\n", tx.Hash())
+			// fmt.Printf("tx Hash: %v\n", tx.Hash())
 			txFrom := getFromAddr(tx, big.NewInt(int64(i)))
-			prunedAddresses[i-cpBlockNum-1][txFrom] = true
+			prunedAddresses[i-upNum][txFrom] = true
 			if tx.To() != nil {
 				txTo := *(tx.To())
-				prunedAddresses[i-cpBlockNum-1][txTo] = true
+				prunedAddresses[i-upNum][txTo] = true
 			}
 		}
 	}
+	bloomElapsed := time.Since(bloomTime) / time.Microsecond
+	fmt.Printf("Bloom time: %d us.\n", bloomElapsed)
 
-	puts("----------------------Pruned Point Query----------------------")
+	fmt.Println("----------------------Pruned Point Query----------------------")
 	startTime := time.Now()
 
 	var longestime = time.Duration(0)
 	var long2ndtime = time.Duration(0)
 	var shortestime = time.Duration(10000000)
 	var short2ndtime = time.Duration(10000000)
-	for i := upNum; i <= endNum; i += inter {
-		localCpBlockNum := i - i%inter
-		roundTime := time.Now()
 
-		// ReadCanonicalHash retrieves the hash assigned to a canonical block number.
-		blkHash := rawdb.ReadCanonicalHash(ancientDb, uint64(localCpBlockNum))
+	var internalTime = time.Duration(0)
+	for i := upNum; i < endNum; i += inter { // i: cpBlk
+		for j := i; j < i+inter; j++ { // j: iterate queried blk
+			roundTime := time.Now()
 
-		if blkHash == (common.Hash{}) {
-			putf("Err: Checkpoint Block not found: %v\n", localCpBlockNum)
-		}
+			// ReadCanonicalHash retrieves the hash assigned to a canonical1 block number.
+			blkHash := rawdb.ReadCanonicalHash(ancientDb, uint64(i))
 
-		// ReadHeader retrieves the block header corresponding to the hash.
-		blkHeader := rawdb.ReadHeader(ancientDb, blkHash, uint64(localCpBlockNum))
-		// putf("Checkpoint Block state root: 0x%x\n", blkHeader.Root)
+			if blkHash == (common.Hash{}) {
+				fmt.Printf("Err: Checkpoint Block not found: %v\n", i)
+			}
 
-		// Retrieve state root and construct the trie accordingly
-		Trie, err := trie.NewStateTrie(common.Hash{}, blkHeader.Root, triedb)
-		if err != nil {
-			panic(err)
-		}
-		acc, err := Trie.TryGetAccount(common.HexToAddress(account).Bytes())
-		if err != nil {
-			puts(err)
-		}
+			// ReadHeader retrieves the block header corresponding to the hash.
+			blkHeader := rawdb.ReadHeader(ancientDb, blkHash, uint64(i))
+			// fmt.Printf("Checkpoint Block state root: 0x%x\n", blkHeader.Root)
 
-		var nowBalance = acc.Balance
-		for j := localCpBlockNum + 1; j <= i; j++ {
-			if prunedAddresses[j-cpBlockNum-1][common.HexToAddress(account)] {
+			// Retrieve state root and construct the trie accordingly
+			Trie, err := trie.NewStateTrie(common.Hash{}, blkHeader.Root, triedb)
+			if err != nil {
+				panic(err)
+			}
+			acc, err := Trie.TryGetAccount(common.HexToAddress(account).Bytes())
+			if err != nil {
+				fmt.Println(err)
+			}
+			var nowBalance = acc.Balance
+
+			var internalStart = time.Now()
+			for k := i + 1; k <= j; k++ {
+				// check bloom filter
+				//if prunedAddresses[k-upNum][common.HexToAddress(account)] {
 				// ReadCanonicalHash retrieves the hash assigned to a canonical block number.
-				blkHash := rawdb.ReadCanonicalHash(ancientDb, uint64(j))
+				blkHash := rawdb.ReadCanonicalHash(ancientDb, uint64(k))
 
 				if blkHash == (common.Hash{}) {
-					putf("Err: Internal Block not found: %v\n", j)
+					fmt.Printf("Err: Internal Block not found: %v\n", k)
 				}
 
 				// ReadBody retrieves the block body corresponding to the hash.
-				blkBody := rawdb.ReadBody(ancientDb, blkHash, uint64(j))
-				// putf("BlkBody Tx size: %d\n", len(blkBody.Transactions))
+				blkBody := rawdb.ReadBody(ancientDb, blkHash, uint64(k))
+				// fmt.Printf("BlkBody Tx size: %d\n", len(blkBody.Transactions))
 
 				// Retrieve transactions and perform rebuilding
 				for _, tx := range blkBody.Transactions {
-					// putf("tx Hash: %v\n", tx.Hash())
-					txFrom := getFromAddr(tx, big.NewInt(int64(j)))
+					// fmt.Printf("tx Hash: %v\n", tx.Hash())
+					txFrom := getFromAddr(tx, big.NewInt(int64(k)))
 					if txFrom == common.HexToAddress(account) {
 						nowBalance.Sub(nowBalance, tx.Value())
 						nowBalance.Sub(nowBalance, tx.GasPrice().Mul(tx.GasPrice(), big.NewInt(21000)))
@@ -532,31 +337,35 @@ func prunedPointQuery(inter int, account string, upNum int, endNum int) {
 						}
 					}
 				}
+				//}
 			}
-		}
-		// putf("Account 0x%x had balance %d in block %d.\n", common.HexToAddress(account), nowBalance, i)
 
-		roundElapsed := time.Since(roundTime) / time.Microsecond
-		if roundElapsed > longestime {
-			long2ndtime = longestime
-			longestime = roundElapsed
-		} else if roundElapsed > long2ndtime {
-			long2ndtime = roundElapsed
-		}
-		if roundElapsed < shortestime {
-			short2ndtime = shortestime
-			shortestime = roundElapsed
-		} else if roundElapsed < short2ndtime {
-			short2ndtime = roundElapsed
-		}
-		if i%10000 == 0 {
-			putf("Block %d passed.\n", i)
+			internalTime += time.Since(internalStart)
+			// fmt.Printf("Account 0x%x had balance %d in block %d.\n", common.HexToAddress(account), nowBalance, i)
+
+			roundElapsed := time.Since(roundTime) / time.Microsecond
+			//fmt.Printf("Block %d time: %d. sub: %d, inter: %d\n", i, roundElapsed, i-localCpBlockNum, inter)
+			if roundElapsed > longestime {
+				long2ndtime = longestime
+				longestime = roundElapsed
+			} else if roundElapsed > long2ndtime {
+				long2ndtime = roundElapsed
+			}
+			if roundElapsed < shortestime {
+				short2ndtime = shortestime
+				shortestime = roundElapsed
+			} else if roundElapsed > shortestime && roundElapsed < short2ndtime {
+				short2ndtime = roundElapsed
+			}
+			if j%10000 == 0 {
+				fmt.Printf("Block %d passed.\n", j)
+			}
 		}
 	}
 
 	elapsedTime := time.Since(startTime) / time.Microsecond
-	putf("Total query time: %d us, average %d us.\n", elapsedTime, elapsedTime/time.Duration((endNum-upNum)/inter+1))
-	putf("Longest query time: %d us, shortest %d us.\n", long2ndtime, short2ndtime)
+	fmt.Printf("Total query time: %d us, internal time: %d us, average %d us.\n", elapsedTime, internalTime/time.Microsecond, elapsedTime/time.Duration(endNum-upNum+1))
+	fmt.Printf("Longest query time: %d us, shortest %d us.\n", long2ndtime, short2ndtime)
 }
 
 func prunedRangeQuery(inter int, account string, upNum int, endNum int, rangeint int) {
@@ -569,11 +378,11 @@ func prunedRangeQuery(inter int, account string, upNum int, endNum int, rangeint
 
 	// ReadHeadHeaderHash retrieves the hash of the current canonical head header.
 	currHeader := rawdb.ReadHeadHeaderHash(ancientDb)
-	putf("currHeader: %x\n", currHeader)
+	fmt.Printf("currHeader: %x\n", currHeader)
 
 	// ReadHeaderNumber returns the header number assigned to a hash.
 	currHeight := rawdb.ReadHeaderNumber(ancientDb, currHeader)
-	putf("currHeight: %d\n", *currHeight)
+	fmt.Printf("currHeight: %d\n", *currHeight)
 
 	// Create in-memory trie database
 	triedb := trie.NewDatabase(ancientDb)
@@ -601,7 +410,7 @@ func prunedRangeQuery(inter int, account string, upNum int, endNum int, rangeint
 	// 		prunedAddresses[i][common.HexToAddress(str)] = true
 	// 	}
 	// }
-	// putf("prunedAddress length = %d\n", len(prunedAddresses))
+	// fmt.Printf("prunedAddress length = %d\n", len(prunedAddresses))
 
 	for i := cpBlockNum + 1; i <= endNum; i++ {
 		prunedAddresses = append(prunedAddresses, map[common.Address]bool{})
@@ -609,7 +418,7 @@ func prunedRangeQuery(inter int, account string, upNum int, endNum int, rangeint
 		// ReadCanonicalHash retrieves the hash assigned to a canonical block number.
 		blkHash := rawdb.ReadCanonicalHash(ancientDb, uint64(i))
 		if blkHash == (common.Hash{}) {
-			putf("Err: Internal Block not found: %v\n", i)
+			fmt.Printf("Err: Internal Block not found: %v\n", i)
 		}
 
 		// ReadBody retrieves the block body corresponding to the hash.
@@ -617,7 +426,7 @@ func prunedRangeQuery(inter int, account string, upNum int, endNum int, rangeint
 
 		// Retrieve transactions and perform rebuilding
 		for _, tx := range blkBody.Transactions {
-			// putf("tx Hash: %v\n", tx.Hash())
+			// fmt.Printf("tx Hash: %v\n", tx.Hash())
 			txFrom := getFromAddr(tx, big.NewInt(int64(i)))
 			prunedAddresses[i-cpBlockNum-1][txFrom] = true
 			if tx.To() != nil {
@@ -627,7 +436,7 @@ func prunedRangeQuery(inter int, account string, upNum int, endNum int, rangeint
 		}
 	}
 
-	puts("----------------------Pruned Range Query----------------------")
+	fmt.Println("----------------------Pruned Range Query----------------------")
 	startTime := time.Now()
 
 	var longestime = time.Duration(0)
@@ -642,12 +451,12 @@ func prunedRangeQuery(inter int, account string, upNum int, endNum int, rangeint
 		blkHash := rawdb.ReadCanonicalHash(ancientDb, uint64(localCpBlockNum))
 
 		if blkHash == (common.Hash{}) {
-			putf("Err: Checkpoint Block not found: %v\n", localCpBlockNum)
+			fmt.Printf("Err: Checkpoint Block not found: %v\n", localCpBlockNum)
 		}
 
 		// ReadHeader retrieves the block header corresponding to the hash.
 		blkHeader := rawdb.ReadHeader(ancientDb, blkHash, uint64(localCpBlockNum))
-		// putf("Checkpoint Block state root: 0x%x\n", blkHeader.Root)
+		// fmt.Printf("Checkpoint Block state root: 0x%x\n", blkHeader.Root)
 
 		// Retrieve state root and construct the trie accordingly
 		Trie, err := trie.NewStateTrie(common.Hash{}, blkHeader.Root, triedb)
@@ -656,7 +465,7 @@ func prunedRangeQuery(inter int, account string, upNum int, endNum int, rangeint
 		}
 		acc, err := Trie.TryGetAccount(common.HexToAddress(account).Bytes())
 		if err != nil {
-			puts(err)
+			fmt.Println(err)
 		}
 
 		var nowBalance = acc.Balance
@@ -668,16 +477,16 @@ func prunedRangeQuery(inter int, account string, upNum int, endNum int, rangeint
 					blkHash := rawdb.ReadCanonicalHash(ancientDb, uint64(k))
 
 					if blkHash == (common.Hash{}) {
-						putf("Err: Internal Block not found: %v\n", k)
+						fmt.Printf("Err: Internal Block not found: %v\n", k)
 					}
 
 					// ReadBody retrieves the block body corresponding to the hash.
 					blkBody := rawdb.ReadBody(ancientDb, blkHash, uint64(k))
-					// putf("BlkBody Tx size: %d\n", len(blkBody.Transactions))
+					// fmt.Printf("BlkBody Tx size: %d\n", len(blkBody.Transactions))
 
 					// Retrieve transactions and perform rebuilding
 					for _, tx := range blkBody.Transactions {
-						// putf("tx Hash: %v\n", tx.Hash())
+						// fmt.Printf("tx Hash: %v\n", tx.Hash())
 						txFrom := getFromAddr(tx, big.NewInt(int64(i)))
 						if txFrom == common.HexToAddress(account) {
 							nowBalance.Sub(nowBalance, tx.Value())
@@ -696,12 +505,12 @@ func prunedRangeQuery(inter int, account string, upNum int, endNum int, rangeint
 				blkHash := rawdb.ReadCanonicalHash(ancientDb, uint64(k))
 
 				if blkHash == (common.Hash{}) {
-					putf("Err: Checkpoint Block not found: %v\n", k)
+					fmt.Printf("Err: Checkpoint Block not found: %v\n", k)
 				}
 
 				// ReadHeader retrieves the block header corresponding to the hash.
 				blkHeader := rawdb.ReadHeader(ancientDb, blkHash, uint64(k))
-				// putf("Checkpoint Block state root: 0x%x\n", blkHeader.Root)
+				// fmt.Printf("Checkpoint Block state root: 0x%x\n", blkHeader.Root)
 
 				// Retrieve state root and construct the trie accordingly
 				Trie, err := trie.NewStateTrie(common.Hash{}, blkHeader.Root, triedb)
@@ -710,7 +519,7 @@ func prunedRangeQuery(inter int, account string, upNum int, endNum int, rangeint
 				}
 				acc, err := Trie.TryGetAccount(common.HexToAddress(account).Bytes())
 				if err != nil {
-					puts(err)
+					fmt.Println(err)
 				}
 				nowBalance = acc.Balance
 			}
@@ -726,41 +535,15 @@ func prunedRangeQuery(inter int, account string, upNum int, endNum int, rangeint
 		if roundElapsed < shortestime {
 			short2ndtime = shortestime
 			shortestime = roundElapsed
-		} else if roundElapsed < short2ndtime {
+		} else if roundElapsed > shortestime && roundElapsed < short2ndtime {
 			short2ndtime = roundElapsed
 		}
 		if i%10000 == 0 {
-			putf("Block %d passed.\n", i)
+			fmt.Printf("Block %d passed.\n", i)
 		}
 	}
 
 	elapsedTime := time.Since(startTime) / time.Microsecond
-	putf("Total query time: %d us, average %d us.\n", elapsedTime, elapsedTime/time.Duration((endNum-upNum)/rangeint+1))
-	putf("Longest query time: %d us, shortest %d us.\n", long2ndtime, short2ndtime)
-}
-
-func main() {
-	if len(os.Args) < 2 {
-		puts("Error! Must indicate the option: $go run main.go [prune/query]")
-	}
-
-	switch os.Args[1] {
-	case "prune":
-		doPrune(os.Args[2:])
-	case "query":
-		doQuery(os.Args[2:])
-	default:
-		puts("Error! Must indicate the option: $go run main.go [prune/query]")
-	}
-}
-
-func getFromAddr(tx *types.Transaction, num *big.Int) common.Address {
-	var signer types.Signer = types.MakeSigner(params.MainnetChainConfig, num)
-
-	from, err := types.Sender(signer, tx)
-	if err != nil {
-		panic(err)
-	}
-
-	return from
+	fmt.Printf("Total query time: %d us, average %d us.\n", elapsedTime, elapsedTime/time.Duration((endNum-upNum)/rangeint+1))
+	fmt.Printf("Longest query time: %d us, shortest %d us.\n", long2ndtime, short2ndtime)
 }
